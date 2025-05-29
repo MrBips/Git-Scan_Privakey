@@ -6,7 +6,7 @@ const chalk = require('chalk');
 // Gom tất cả biến cấu hình vào object config
 const config = {
   // Token xác thực GitHub, nếu không có sẽ dùng token mặc định
-  GITHUB_TOKEN: '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',
+  GITHUB_TOKEN: '',
   
   // Thời gian giữa các lần kiểm tra (mili giây), mặc định 30 giây
   CHECK_INTERVAL: 30000,
